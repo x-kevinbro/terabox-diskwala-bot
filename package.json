@@ -1,0 +1,16 @@
+{
+  "name": "diskwala-terabox-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot that detects Diskwala/Terabox share links, shows file info with download buttons, and delivers files into the chat.",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "license": "MIT",
+  "dependencies": {}
+}

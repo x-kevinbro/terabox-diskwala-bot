@@ -1,0 +1,31 @@
+{
+  "name": "Diskwala & Terabox Telegram Bot",
+  "description": "Telegram bot that resolves Diskwala/Terabox share links, shows file info with download buttons, and delivers files into the chat.",
+  "repository": "https://github.com/x-kevinbro/terabox-diskwala-bot",
+  "keywords": ["telegram", "terabox", "diskwala", "bot", "nodejs"],
+  "stack": "heroku-24",
+  "buildpacks": [{ "url": "heroku/nodejs" }],
+  "env": {
+    "BOT_TOKEN": {
+      "description": "Telegram bot token from @BotFather",
+      "required": true
+    },
+    "TERABOX_COOKIES": {
+      "description": "Terabox account cookie, e.g. ndus=XXXX; lang=en (comma-separate several accounts)",
+      "required": true
+    },
+    "MAX_FILE_MB": {
+      "description": "Max file size (MB) to upload into Telegram. Cloud Bot API limit is 50, so keep 48 on Heroku.",
+      "value": "48",
+      "required": false
+    },
+    "REQUEST_TIMEOUT_MS": {
+      "description": "Upstream resolver timeout in ms",
+      "value": "25000",
+      "required": false
+    }
+  },
+  "formation": {
+    "worker": { "quantity": 1, "size": "eco" }
+  }
+}

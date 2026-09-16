@@ -14,10 +14,57 @@ const PROVIDER_STYLE = {
 
 const DIVIDER = '┄┄┄┄┄┄┄┄┄┄┄┄┄┄';
 
+// Quality-picker card (YouTube): the actual download links resolve lazily
+// when a quality button is tapped. Callback data: q:<cacheId>:<format>:<type>
+// for downloads, k:<cacheId>:<format>:<type> for the direct link.
+function buildQualityPayload(result, cacheId) {
+  const style = PROVIDER_STYLE[result.provider] || {
+    icon: '📦',
+    label: result.provider.toUpperCase(),
+  };
+  const lines = [
+    `${style.icon} <b><u>${style.label} — LINK READY</u></b>`,
+    '',
+    '<code>▎✅ Video found</code>',
+    '',
+    DIVIDER,
+    `🎬 ${esc(result.title || 'YouTube video')}`,
+  ];
+  if (result.author) lines.push(`📺 ${esc(result.author)}`);
+  lines.push(
+    DIVIDER,
+    '',
+    '<b>👇 Pick a quality:</b>',
+    '',
+    '<blockquote>📺 <b>MP4</b> — video (360p / 720p)\n🎵 <b>MP3</b> — audio only</blockquote>',
+  );
+
+  const keyboard = [
+    [
+      { text: '📺 360p MP4', callback_data: `q:${cacheId}:360:mp4` },
+      { text: '📺 720p MP4', callback_data: `q:${cacheId}:720:mp4` },
+    ],
+    [
+      { text: '🎵 MP3 Audio', callback_data: `q:${cacheId}:best:mp3` },
+      { text: '🔗 360p link', callback_data: `k:${cacheId}:360:mp4` },
+    ],
+  ];
+
+  return {
+    text: lines.join('\n'),
+    reply_markup: { inline_keyboard: keyboard },
+    fileCount: 1,
+  };
+}
+
 // Build the info message + inline keyboard for a resolved share link.
 // Button callback_data format: "dl:<cacheId>:<fileIndex>" / "ln:<cacheId>:<fileIndex>"
 // (Telegram caps callback_data at 64 bytes — hence the short cache id.)
 export function buildInfoPayload(result, cacheId) {
+  if (Array.isArray(result.qualities) && result.qualities.length) {
+    return buildQualityPayload(result, cacheId);
+  }
+
   const files = result.files.filter((f) => !f.is_dir);
   const shown = files.slice(0, MAX_BUTTONS);
   const maxBytes = config.maxFileMb * 1024 * 1024;

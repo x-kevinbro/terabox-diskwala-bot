@@ -7,7 +7,7 @@ import { cookiePool } from './src/cookies.js';
 import * as tg from './src/telegram.js';
 import { extractMediaLinks } from './src/detect.js';
 import { buildInfoPayload, esc } from './src/format.js';
-import { formatSize } from './src/utils.js';
+import { formatSize, fileEmoji } from './src/utils.js';
 import { Cache } from './src/cache.js';
 
 if (!config.botToken) {
@@ -125,28 +125,35 @@ async function handleMessage(msg) {
   // Private bot: first /start claims ownership; everyone else is rejected.
   if (!ownerIds.size) {
     if (!text.startsWith('/start')) {
-      await tg.sendMessage(chatId, "🔒 This bot isn't claimed yet. Send /start to become its owner.");
+      await tg.sendMessage(
+        chatId,
+        "🔒 <b>Private bot</b>\n\nIt isn't claimed yet — send /start to become its owner. 👑",
+      );
       return;
     }
     claimOwner(chatId);
     await tg.sendMessage(
       chatId,
-      `✅ <b>You are now the owner</b> — only your account can use this bot. (ID: <code>${chatId}</code>)`,
+      `✅ <b>Ownership claimed!</b> 👑\n\n<blockquote>Only your account can use this bot from now on.</blockquote>\n🆔 <code>${chatId}</code>`,
     );
   } else if (!ownerIds.has(String(chatId))) {
     console.log(`[access] blocked unauthorized chat ${chatId}`);
-    await tg.sendMessage(chatId, '🔒 Private bot — access denied.');
+    await tg.sendMessage(chatId, '🔒 <b>Private bot</b>\n<blockquote>Access denied.</blockquote>');
     return;
   }
 
   if (text.startsWith('/start') || text.startsWith('/help')) {
     await tg.sendMessage(
       chatId,
-      `👋 <b>Diskwala & Terabox Downloader Bot</b>\n\n` +
-        `Send me a Diskwala or Terabox share link and I'll reply with the file info and download buttons.\n\n` +
-        `• Files up to ${config.maxFileMb} MB land right here in the chat\n` +
-        `• Bigger files get a direct download link instead\n\n` +
-        `Just paste a link 🔗`,
+      `👋 <b>Welcome to the Diskwala & Terabox Downloader!</b>\n\n` +
+        `<blockquote>🔗 Send me a share link and I'll fetch the file info instantly.</blockquote>\n\n` +
+        `<b>What I can do:</b>\n` +
+        `🎬 Diskwala links → info + downloads\n` +
+        `🌐 Terabox links → info + downloads\n` +
+        `▶️ YouTube links → video downloads\n` +
+        `📦 Files up to <b>${config.maxFileMb} MB</b> land right here in chat\n` +
+        `🔗 Bigger files get a direct download link\n\n` +
+        `<i>Just paste a link to start ⚡</i>`,
     );
     return;
   }
@@ -156,13 +163,13 @@ async function handleMessage(msg) {
     if (text.startsWith('/')) return; // ignore unknown commands silently
     await tg.sendMessage(
       chatId,
-      '🤔 No Diskwala/Terabox link found there. Send a share link like <code>https://terabox.com/s/xxxx</code>',
+      '🤔 <b>No link found there.</b>\n\nSend me a Diskwala, Terabox, or YouTube link, e.g.\n<code>https://youtu.be/xxxx</code>',
     );
     return;
   }
 
   for (const { url, provider } of links) {
-    const status = await tg.sendMessage(chatId, '🔍 Resolving link…');
+    const status = await tg.sendMessage(chatId, '🔍 <i>Resolving your link…</i> ⏳');
     try {
       const result = await provider.resolveInfo(url, {
         cookies: cookiePool,
@@ -176,66 +183,33 @@ async function handleMessage(msg) {
         reply_to_message_id: msg.message_id,
       });
     } catch (err) {
-      await tg.editMessageText(chatId, status.message_id, `❌ <b>Failed:</b> ${esc(err.message)}`);
+      await tg.editMessageText(
+        chatId,
+        status.message_id,
+        `❌ <b>Failed to resolve</b>\n<blockquote>${esc(err.message)}</blockquote>`,
+      );
     }
   }
 }
 
-async function handleCallback(cq) {
-  const chatId = cq.message && cq.message.chat && cq.message.chat.id;
-  if (ownerIds.size && !ownerIds.has(String(chatId))) {
-    await tg.answerCallbackQuery(cq.id, '🔒 Private bot', true);
-    return;
-  }
-  const [action, id, idxStr] = String(cq.data || '').split(':');
-  const entry = cache.get(id);
-  if (!chatId || !entry || !['dl', 'ln'].includes(action)) {
-    await tg.answerCallbackQuery(cq.id, '⚠️ This button expired — send the link again', true);
-    return;
-  }
-  const files = entry.result.files.filter((f) => !f.is_dir);
-  const file = files[Number.parseInt(idxStr, 10)];
-  if (!file || !file.dlink) {
-    await tg.answerCallbackQuery(cq.id, 'File not found', true);
-    return;
-  }
-
-  // "🔗" button — just send the direct link.
-  if (action === 'ln') {
-    await tg.answerCallbackQuery(cq.id, '🔗 Direct link sent below');
-    await tg.sendMessage(
+// Download + upload pipeline shared by direct downloads and quality picks.
+// Reuses an existing status message when one is passed (quality flow).
+async function deliverFile(chatId, file, provider, status = null) {
+  const statusMsg =
+    status ||
+    (await tg.sendMessage(
       chatId,
-      `🔗 <b>${esc(file.name)}</b> (${esc(file.size)})\n${file.dlink}\n\n<i>Direct links expire — use it soon.</i>`,
-    );
-    return;
-  }
-
-  // "⬇️" button — deliver the file into the chat.
-  if (file.size_bytes > maxBytes) {
-    await tg.answerCallbackQuery(
-      cq.id,
-      `⚠️ ${file.size} is over the ${config.maxFileMb} MB bot limit — link only`,
-      true,
-    );
-    await tg.sendMessage(
-      chatId,
-      `⚠️ <b>${esc(file.name)}</b> (${esc(file.size)}) is larger than Telegram's ${config.maxFileMb} MB bot upload limit, so I can't send it here.\n\n🔗 Direct link:\n${file.dlink}\n\n<i>Tip: run a local Bot API server to raise the limit to 2 GB — see README.</i>`,
-    );
-    return;
-  }
-
-  await tg.answerCallbackQuery(cq.id, '⏳ Working on it…');
-  const status = await tg.sendMessage(
-    chatId,
-    `⏳ Downloading <b>${esc(file.name)}</b> (${esc(file.size)})…`,
-  );
+      `⏬ <b>Preparing download…</b>\n${fileEmoji(file.name)} <b>${esc(file.name)}</b>\n💾 <code>${esc(file.size)}</code>`,
+    ));
+  const statusId = statusMsg.message_id;
   let tmp = null;
   let thumbPath = null;
   try {
     const fname = safeFileName(file.name, file.dlink);
     const kind = mediaKind(fname);
-    const headers = entry.provider.downloadHeaders(cookiePool.next() || '');
+    const headers = provider.downloadHeaders(cookiePool.next() || '');
     let lastEdit = 0;
+    const startedAt = Date.now();
     const onProgress = (received, total) => {
       const now = Date.now();
       if (now - lastEdit < 4000) return; // stay under Telegram's edit rate limit
@@ -244,11 +218,13 @@ async function handleCallback(cq) {
       const bar =
         pct == null
           ? ''
-          : `\n${'▓'.repeat(Math.floor(pct / 10))}${'░'.repeat(10 - Math.floor(pct / 10))} ${pct}%`;
+          : `${'▰'.repeat(Math.floor(pct / 10))}${'▱'.repeat(10 - Math.floor(pct / 10))} ${pct}%`;
+      const secs = Math.max(1, (now - startedAt) / 1000);
+      const speed = `${formatSize(Math.round(received / secs))}/s`;
       tg.editMessageText(
         chatId,
-        status.message_id,
-        `⏳ Downloading <b>${esc(fname)}</b>… ${esc(formatSize(received))}${total ? ` / ${esc(formatSize(total))}` : ''}${bar}`,
+        statusId,
+        `⏬ <b>Downloading…</b>\n${fileEmoji(fname)} <b>${esc(fname)}</b>\n💾 <code>${esc(formatSize(received))}${total ? ` / ${esc(formatSize(total))}` : ''}</code>  ⚡ <code>${esc(speed)}</code>${bar ? `\n${bar}` : ''}`,
       );
     };
     tmp = await downloadToDisk(file.dlink, headers, extOf(fname), onProgress);
@@ -266,14 +242,14 @@ async function handleCallback(cq) {
 
     await tg.editMessageText(
       chatId,
-      status.message_id,
-      `📤 Uploading <b>${esc(fname)}</b> to Telegram… (big files can take a while)`,
+      statusId,
+      `📤 <b>Uploading to Telegram…</b>\n${fileEmoji(fname)} <b>${esc(fname)}</b>\n💾 <code>${esc(file.size)}</code>\n<blockquote>☕ Big files can take a while — hang tight.</blockquote>`,
     );
     await tg.sendChatAction(
       chatId,
       kind === 'video' ? 'upload_video' : kind === 'audio' ? 'upload_audio' : 'upload_document',
     );
-    const caption = `📦 ${esc(fname)} (${esc(file.size)})`;
+    const caption = `✅ <b>${esc(fname)}</b>\n💾 ${esc(file.size)}`;
     try {
       await tg.sendFile({ chatId, filePath: tmp, filename: fname, caption, kind, thumbPath });
     } catch (e1) {
@@ -282,20 +258,116 @@ async function handleCallback(cq) {
       console.error(`${kind} upload failed (${e1.message}) — retrying as document`);
       await tg.sendFile({ chatId, filePath: tmp, filename: fname, caption, kind: 'document' });
     }
-    await tg.deleteMessage(chatId, status.message_id);
+    await tg.deleteMessage(chatId, statusId);
   } catch (err) {
     const reason = err.tooBig
       ? `the file exceeded the ${config.maxFileMb} MB limit while downloading`
       : esc(err.message);
     await tg.editMessageText(
       chatId,
-      status.message_id,
-      `❌ <b>${esc(file.name)}</b> failed: ${reason}\n\n🔗 Direct link:\n${file.dlink}`,
+      statusId,
+      `❌ <b>Download failed</b>\n${fileEmoji(file.name)} <b>${esc(file.name)}</b>\n<blockquote>${reason}</blockquote>\n🔗 <b>Direct link:</b>\n<pre>${esc(file.dlink)}</pre>`,
     );
   } finally {
     if (tmp) fs.unlink(tmp, () => {});
     if (thumbPath) fs.unlink(thumbPath, () => {});
   }
+}
+
+async function handleCallback(cq) {
+  const chatId = cq.message && cq.message.chat && cq.message.chat.id;
+  if (ownerIds.size && !ownerIds.has(String(chatId))) {
+    await tg.answerCallbackQuery(cq.id, '🔒 Private bot', true);
+    return;
+  }
+  const [action, id, a, b] = String(cq.data || '').split(':');
+  const entry = cache.get(id);
+  if (!chatId || !entry || !['dl', 'ln', 'q', 'k'].includes(action)) {
+    await tg.answerCallbackQuery(cq.id, '⚠️ This button expired — send the link again', true);
+    return;
+  }
+
+  // --- Quality pick (YouTube): "q" downloads, "k" sends the direct link ---
+  if (action === 'q' || action === 'k') {
+    const format = a;
+    const type = b;
+    const qualityLabel = type === 'mp3' ? 'MP3 audio' : `${format}p`;
+    if (!entry.provider.resolveQuality) {
+      await tg.answerCallbackQuery(cq.id, 'Quality choice is not supported for this link', true);
+      return;
+    }
+    await tg.answerCallbackQuery(cq.id, `⏬ Preparing ${qualityLabel}…`);
+    const status = await tg.sendMessage(
+      chatId,
+      `🔍 <i>Resolving ${esc(qualityLabel)}…</i> ⏳\n<blockquote>☕ The YouTube API can take ~1 minute.</blockquote>`,
+    );
+    let file;
+    try {
+      file = await entry.provider.resolveQuality(entry.result.share_url, format, type, {
+        cookies: cookiePool,
+        timeoutMs: config.requestTimeoutMs,
+      });
+    } catch (err) {
+      await tg.editMessageText(
+        chatId,
+        status.message_id,
+        `❌ <b>Failed to resolve ${esc(qualityLabel)}</b>\n<blockquote>${esc(err.message)}</blockquote>`,
+      );
+      return;
+    }
+    if (action === 'k') {
+      await tg.editMessageText(
+        chatId,
+        status.message_id,
+        `🔗 <b>Direct link</b>\n${fileEmoji(file.name)} <b>${esc(file.name)}</b>\n💾 <code>${esc(file.size)}</code>\n\n<pre>${esc(file.dlink)}</pre>\n⏳ <i>Expires soon — use it now.</i>`,
+      );
+      return;
+    }
+    if (file.size_bytes > maxBytes) {
+      await tg.editMessageText(
+        chatId,
+        status.message_id,
+        `⚠️ <b>Too big for Telegram</b>\n\n${fileEmoji(file.name)} <b>${esc(file.name)}</b>\n💾 <code>${esc(file.size)}</code> — over the ${config.maxFileMb} MB bot limit.\n\n🔗 <b>Direct link:</b>\n<pre>${esc(file.dlink)}</pre>`,
+      );
+      return;
+    }
+    await deliverFile(chatId, file, entry.provider, status);
+    return;
+  }
+
+  const files = entry.result.files.filter((f) => !f.is_dir);
+  const file = files[Number.parseInt(a, 10)];
+  if (!file || !file.dlink) {
+    await tg.answerCallbackQuery(cq.id, 'File not found', true);
+    return;
+  }
+
+  // "🔗" button — just send the direct link.
+  if (action === 'ln') {
+    await tg.answerCallbackQuery(cq.id, '🔗 Direct link sent below');
+    await tg.sendMessage(
+      chatId,
+      `🔗 <b>Direct link</b>\n${fileEmoji(file.name)} <b>${esc(file.name)}</b>\n💾 <code>${esc(file.size)}</code>\n\n<pre>${esc(file.dlink)}</pre>\n⏳ <i>Expires soon — use it now.</i>`,
+    );
+    return;
+  }
+
+  // "⬇️" button — deliver the file into the chat.
+  if (file.size_bytes > maxBytes) {
+    await tg.answerCallbackQuery(
+      cq.id,
+      `⚠️ ${file.size} is over the ${config.maxFileMb} MB bot limit — link only`,
+      true,
+    );
+    await tg.sendMessage(
+      chatId,
+      `⚠️ <b>Too big for Telegram</b>\n\n${fileEmoji(file.name)} <b>${esc(file.name)}</b>\n💾 <code>${esc(file.size)}</code> — over the ${config.maxFileMb} MB bot limit.\n\n🔗 <b>Direct link:</b>\n<pre>${esc(file.dlink)}</pre>\n\n<i>💡 The local Bot API server raises this limit to 2 GB.</i>`,
+    );
+    return;
+  }
+
+  await tg.answerCallbackQuery(cq.id, '⏬ Download started…');
+  await deliverFile(chatId, file, entry.provider);
 }
 
 async function main() {

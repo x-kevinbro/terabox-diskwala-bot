@@ -1,7 +1,7 @@
 // Zero-config media download API.
-// Terabox-family links resolve metadata with no user-supplied cookie/login
-// (self-refreshing shared cookie pool). Diskwala links resolve fully via a
-// free public resolver (see DISKWALA_RESOLVER_URL).
+// Terabox-family links work with no user-supplied cookie/login — cookies come
+// from a self-refreshing shared pool. Diskwala links return an honest error
+// (their API requires browser-signed requests + a logged-in session).
 
 import http from 'node:http';
 import { Readable } from 'node:stream';
@@ -85,6 +85,7 @@ async function handleInfo(req, res, u) {
       share_url: url,
       file_count: files.length,
       files,
+      ...(result.qualities ? { title: result.title, author: result.author, qualities: result.qualities } : {}),
     });
   } catch (err) {
     return sendJson(res, err.status || 502, {
@@ -148,6 +149,26 @@ async function handleDownload(req, res, u) {
   } catch (err) {
     return sendJson(res, err.status || 502, { success: false, error: err.message });
   }
+
+  // Quality pick (YouTube): /api/download?url=...&format=720&type=mp4
+  const qFormat = u.searchParams.get('format');
+  const qType = u.searchParams.get('type');
+  if ((qFormat || qType) && resolved.provider.resolveQuality) {
+    try {
+      const f = await resolved.provider.resolveQuality(url, qFormat || '360', qType || 'mp4', {
+        cookies: sharedCookiePool,
+        timeoutMs: config.requestTimeoutMs,
+      });
+      if (redirect) {
+        res.writeHead(302, { Location: f.dlink, 'Access-Control-Allow-Origin': '*' });
+        return res.end();
+      }
+      return streamDownload(req, res, f.dlink, f.name, resolved.provider.name);
+    } catch (err) {
+      return sendJson(res, 502, { success: false, error: err.message });
+    }
+  }
+
   const files = resolved.result.files.filter((f) => !f.is_dir && f.dlink);
   const index = Math.max(0, Number.parseInt(u.searchParams.get('index') || '0', 10) || 0);
   const file = files[index];
@@ -181,9 +202,9 @@ const server = http.createServer(async (req, res) => {
     if (path === '/') {
       return sendJson(res, 200, {
         name: 'media-dl-api',
-        version: '1.1.0',
+        version: '1.2.0',
         description:
-          'Zero-config downloader API. Diskwala links resolve fully (free public resolver). Terabox links resolve metadata via a shared cookie pool; direct downloads depend on Terabox verify_v2 status.',
+          'Zero-config downloader API. Diskwala links resolve fully (free public resolver). Terabox links resolve via an external download API (cookie pool fallback for metadata).',
         endpoints: {
           'GET /api/info?url=<share-link>': 'file metadata + direct download links',
           'GET /api/download?url=<share-link>[&index=N]': 'download the file (add &redirect=1 for a 302 to the raw link)',
@@ -198,8 +219,10 @@ const server = http.createServer(async (req, res) => {
         status: 'ok',
         shared_cookies: sharedCookiePool.size,
         uptime_seconds: Math.round(process.uptime()),
+        terabox: process.env.TERABOX_API_KEY
+          ? 'operational (external resolver API + cookie pool fallback)'
+          : 'metadata only (shared cookie pool)',
         diskwala: 'operational (public resolver)',
-        terabox: 'metadata operational; downloads gated by Terabox verify_v2',
       });
     }
     if (!authorized(req, u)) {

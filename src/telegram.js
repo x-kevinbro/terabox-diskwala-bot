@@ -70,7 +70,7 @@ const MIME_BY_EXT = {
 // Upload a file from disk using multipart/form-data. kind: video | audio | document.
 // A real File with an explicit name + MIME type keeps the filename/extension
 // intact end-to-end (bare Blobs can lose it in some multipart stacks).
-export async function sendFile({ chatId, filePath, filename, caption, kind = 'document' }) {
+export async function sendFile({ chatId, filePath, filename, caption, kind = 'document', thumbPath = null }) {
   const blob = await openAsBlob(filePath);
   const form = new FormData();
   form.append('chat_id', String(chatId));
@@ -84,6 +84,13 @@ export async function sendFile({ chatId, filePath, filename, caption, kind = 'do
   const ext = (/\.([A-Za-z0-9]{1,5})$/.exec(filename || '') || [])[1]?.toLowerCase() || '';
   const file = new File([blob], filename, { type: MIME_BY_EXT[ext] || 'application/octet-stream' });
   form.append(field, file, filename);
+  if (kind === 'audio') form.append('title', filename.replace(/\.[^.]+$/, ''));
+  if (thumbPath && (kind === 'video' || kind === 'audio')) {
+    try {
+      const thumbBlob = await openAsBlob(thumbPath);
+      form.append('thumbnail', new File([thumbBlob], 'thumb.jpg', { type: 'image/jpeg' }), 'thumb.jpg');
+    } catch {}
+  }
 
   const resp = await fetch(`${base()}/${method}`, {
     method: 'POST',

@@ -7,6 +7,7 @@ import { cookiePool } from './src/cookies.js';
 import * as tg from './src/telegram.js';
 import { extractMediaLinks } from './src/detect.js';
 import { buildInfoPayload, esc } from './src/format.js';
+import { formatSize } from './src/utils.js';
 import { Cache } from './src/cache.js';
 
 if (!config.botToken) {
@@ -19,6 +20,23 @@ fs.mkdirSync(downloadDir, { recursive: true });
 
 const cache = new Cache();
 const maxBytes = config.maxFileMb * 1024 * 1024;
+
+// --- Access control (private bot) ---
+// Owner ids come from ALLOWED_USERS (comma-separated) and/or data/owner.json.
+// When neither exists, the first /start claims ownership (persisted to disk).
+const ownerFile = path.resolve('data/owner.json');
+const ownerIds = new Set(
+  (process.env.ALLOWED_USERS || '').split(',').map((s) => s.trim()).filter(Boolean),
+);
+try {
+  for (const id of JSON.parse(fs.readFileSync(ownerFile, 'utf8'))) ownerIds.add(String(id));
+} catch {}
+function claimOwner(chatId) {
+  ownerIds.add(String(chatId));
+  fs.mkdirSync(path.dirname(ownerFile), { recursive: true });
+  fs.writeFileSync(ownerFile, JSON.stringify([...ownerIds]));
+  console.log(`[access] owner claimed: ${chatId}`);
+}
 
 const VIDEO_EXT = new Set(['mp4', 'mkv', 'webm', 'mov', 'm4v', 'avi', 'mpg', 'mpeg']);
 const AUDIO_EXT = new Set(['mp3', 'm4a', 'flac', 'wav', 'ogg', 'aac', 'opus', 'wma']);
@@ -55,7 +73,7 @@ function safeFileName(name, dlink) {
 
 // Download a dlink to a temp file, enforcing the size cap both from the
 // content-length header and while streaming.
-async function downloadToDisk(dlink, headers, ext = '') {
+async function downloadToDisk(dlink, headers, ext = '', onProgress = null) {
   const resp = await fetch(dlink, { headers, redirect: 'follow' });
   if (!resp.ok && resp.status !== 206) {
     resp.body?.cancel().catch(() => {});
@@ -76,6 +94,11 @@ async function downloadToDisk(dlink, headers, ext = '') {
   const guard = new Transform({
     transform(chunk, enc, cb) {
       received += chunk.length;
+      if (onProgress) {
+        try {
+          onProgress(received, len);
+        } catch {}
+      }
       if (received > maxBytes) {
         const e = new Error('too_big');
         e.tooBig = true;
@@ -98,6 +121,23 @@ async function handleMessage(msg) {
   const chatId = msg.chat && msg.chat.id;
   if (!chatId) return;
   const text = msg.text || msg.caption || '';
+
+  // Private bot: first /start claims ownership; everyone else is rejected.
+  if (!ownerIds.size) {
+    if (!text.startsWith('/start')) {
+      await tg.sendMessage(chatId, "🔒 This bot isn't claimed yet. Send /start to become its owner.");
+      return;
+    }
+    claimOwner(chatId);
+    await tg.sendMessage(
+      chatId,
+      `✅ <b>You are now the owner</b> — only your account can use this bot. (ID: <code>${chatId}</code>)`,
+    );
+  } else if (!ownerIds.has(String(chatId))) {
+    console.log(`[access] blocked unauthorized chat ${chatId}`);
+    await tg.sendMessage(chatId, '🔒 Private bot — access denied.');
+    return;
+  }
 
   if (text.startsWith('/start') || text.startsWith('/help')) {
     await tg.sendMessage(
@@ -143,6 +183,10 @@ async function handleMessage(msg) {
 
 async function handleCallback(cq) {
   const chatId = cq.message && cq.message.chat && cq.message.chat.id;
+  if (ownerIds.size && !ownerIds.has(String(chatId))) {
+    await tg.answerCallbackQuery(cq.id, '🔒 Private bot', true);
+    return;
+  }
   const [action, id, idxStr] = String(cq.data || '').split(':');
   const entry = cache.get(id);
   if (!chatId || !entry || !['dl', 'ln'].includes(action)) {
@@ -186,23 +230,52 @@ async function handleCallback(cq) {
     `⏳ Downloading <b>${esc(file.name)}</b> (${esc(file.size)})…`,
   );
   let tmp = null;
+  let thumbPath = null;
   try {
     const fname = safeFileName(file.name, file.dlink);
+    const kind = mediaKind(fname);
     const headers = entry.provider.downloadHeaders(cookiePool.next() || '');
-    tmp = await downloadToDisk(file.dlink, headers, extOf(fname));
+    let lastEdit = 0;
+    const onProgress = (received, total) => {
+      const now = Date.now();
+      if (now - lastEdit < 4000) return; // stay under Telegram's edit rate limit
+      lastEdit = now;
+      const pct = total ? Math.floor((received / total) * 100) : null;
+      const bar =
+        pct == null
+          ? ''
+          : `\n${'▓'.repeat(Math.floor(pct / 10))}${'░'.repeat(10 - Math.floor(pct / 10))} ${pct}%`;
+      tg.editMessageText(
+        chatId,
+        status.message_id,
+        `⏳ Downloading <b>${esc(fname)}</b>… ${esc(formatSize(received))}${total ? ` / ${esc(formatSize(total))}` : ''}${bar}`,
+      );
+    };
+    tmp = await downloadToDisk(file.dlink, headers, extOf(fname), onProgress);
+
+    // Attach the provider thumbnail to playable media when available.
+    if (file.thumbnail && (kind === 'video' || kind === 'audio')) {
+      try {
+        const t = await fetch(file.thumbnail, { signal: AbortSignal.timeout(15_000) });
+        if (t.ok) {
+          thumbPath = `${tmp}.jpg`;
+          fs.writeFileSync(thumbPath, Buffer.from(await t.arrayBuffer()));
+        }
+      } catch {}
+    }
+
     await tg.editMessageText(
       chatId,
       status.message_id,
-      `📤 Uploading <b>${esc(fname)}</b> to Telegram…`,
+      `📤 Uploading <b>${esc(fname)}</b> to Telegram… (big files can take a while)`,
     );
-    const kind = mediaKind(fname);
     await tg.sendChatAction(
       chatId,
       kind === 'video' ? 'upload_video' : kind === 'audio' ? 'upload_audio' : 'upload_document',
     );
     const caption = `📦 ${esc(fname)} (${esc(file.size)})`;
     try {
-      await tg.sendFile({ chatId, filePath: tmp, filename: fname, caption, kind });
+      await tg.sendFile({ chatId, filePath: tmp, filename: fname, caption, kind, thumbPath });
     } catch (e1) {
       if (kind === 'document') throw e1;
       // Telegram may reject some containers as video/audio — retry as a plain document.
@@ -221,6 +294,7 @@ async function handleCallback(cq) {
     );
   } finally {
     if (tmp) fs.unlink(tmp, () => {});
+    if (thumbPath) fs.unlink(thumbPath, () => {});
   }
 }
 

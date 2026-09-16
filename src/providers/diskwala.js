@@ -48,16 +48,20 @@ export async function resolveInfo(shareUrl, ctx) {
     );
   }
 
-  const ext = file.extension || 'mp4';
+  const ext = String(file.extension || 'mp4').toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
+  let fileName = String(file.name || 'diskwala').trim() || 'diskwala';
+  // The resolver sometimes returns a name WITHOUT the extension (the extension
+  // only lives in a separate field) — append it when missing.
+  if (!fileName.toLowerCase().endsWith(`.${ext}`)) fileName = `${fileName}.${ext}`;
   return {
     provider: name,
     share_url: shareUrl,
     final_url: shareUrl,
     surl: '',
-    title: file.name || '',
+    title: fileName,
     files: [
       {
-        name: file.name || `diskwala.${ext}`,
+        name: fileName,
         size: formatSize(file.size || 0),
         size_bytes: file.size || 0,
         thumbnail: file.thumb || '',

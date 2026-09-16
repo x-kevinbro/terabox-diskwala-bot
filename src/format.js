@@ -4,13 +4,12 @@ import { fileEmoji } from './utils.js';
 export const esc = (s) =>
   String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-const trunc = (s, n = 22) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
-
 const MAX_BUTTONS = 10; // Telegram allows up to 100, but keep messages tidy.
 
 const PROVIDER_STYLE = {
   diskwala: { icon: '🎬', label: 'DISKWALA' },
   terabox: { icon: '🌐', label: 'TERABOX' },
+  youtube: { icon: '📺', label: 'YOUTUBE' },
 };
 
 const DIVIDER = '┄┄┄┄┄┄┄┄┄┄┄┄┄┄';
@@ -28,19 +27,20 @@ export function buildInfoPayload(result, cacheId) {
   };
 
   const lines = [
-    `${style.icon} <b>${style.label} — LINK READY</b>`,
+    `${style.icon} <b><u>${style.label} — LINK READY</u></b>`,
+    '',
     files.length
-      ? `<blockquote>✅ ${files.length} file${files.length === 1 ? '' : 's'} resolved</blockquote>`
-      : '<blockquote>📭 Empty share</blockquote>',
+      ? `<code>▎✅ ${files.length} file${files.length === 1 ? '' : 's'} resolved</code>`
+      : '<code>▎📭 Empty share</code>',
+    '',
     DIVIDER,
   ];
 
   shown.forEach((f, i) => {
     const tooBig = f.size_bytes > maxBytes;
-    lines.push(`${fileEmoji(f.name)} <b>${esc(f.name)}</b>`);
+    lines.push(`${fileEmoji(f.name)} ${esc(f.name)}`);
     lines.push(
-      `   💾 <code>${esc(f.size)}</code>` +
-        (tooBig ? '  •  ⚠️ <i>over chat limit — link only</i>' : ''),
+      `💾 ${esc(f.size)}` + (tooBig ? '  •  ⚠️ <i>over chat limit — link only</i>' : ''),
     );
     if (i < shown.length - 1) lines.push('');
   });
@@ -58,14 +58,14 @@ export function buildInfoPayload(result, cacheId) {
   lines.push(
     DIVIDER,
     '',
-    '👇 <b>Pick an action:</b>',
-    '⬇️ <b>Download</b> — file lands right here in chat',
-    '🔗 <b>Direct link</b> — raw URL, tap to copy',
+    '<b>👇 Pick an action:</b>',
+    '',
+    '<blockquote>⬇️ <b>Download</b> — file lands right here in chat\n🔗 <b>Direct link</b> — raw URL, tap to copy</blockquote>',
   );
 
   const keyboard = shown.map((f, i) => [
     {
-      text: `⬇️ Download${files.length > 1 ? ` #${i + 1}` : ''} (${f.size})`,
+      text: files.length > 1 ? `⬇️ Download #${i + 1}` : '⬇️ Download',
       callback_data: `dl:${cacheId}:${i}`,
     },
     {

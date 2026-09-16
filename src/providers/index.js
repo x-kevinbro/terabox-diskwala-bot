@@ -1,8 +1,9 @@
 import * as terabox from './terabox.js';
 import * as diskwala from './diskwala.js';
+import * as youtube from './youtube.js';
 import { config } from '../config.js';
 
-const providers = [terabox, diskwala];
+const providers = [terabox, diskwala, youtube];
 
 export function getProvider(providerName) {
   return providers.find((p) => p.name === providerName) || null;

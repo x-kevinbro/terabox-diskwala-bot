@@ -59,9 +59,18 @@ export const answerCallbackQuery = (id, text = '', showAlert = false) =>
 export const sendChatAction = (chatId, action) =>
   call('sendChatAction', { chat_id: chatId, action }).catch(() => null);
 
-// Upload a file from disk using multipart/form-data (streamed via openAsBlob,
-// so even large files are not fully buffered in memory).
-export async function sendFile({ chatId, filePath, filename, caption, asVideo }) {
+const MIME_BY_EXT = {
+  mp4: 'video/mp4', mkv: 'video/x-matroska', webm: 'video/webm', mov: 'video/quicktime',
+  m4v: 'video/x-m4v', avi: 'video/x-msvideo', mpg: 'video/mpeg', mpeg: 'video/mpeg',
+  mp3: 'audio/mpeg', m4a: 'audio/mp4', flac: 'audio/flac', wav: 'audio/wav',
+  ogg: 'audio/ogg', aac: 'audio/aac', opus: 'audio/opus', wma: 'audio/x-ms-wma',
+  zip: 'application/zip', apk: 'application/vnd.android.package-archive',
+};
+
+// Upload a file from disk using multipart/form-data. kind: video | audio | document.
+// A real File with an explicit name + MIME type keeps the filename/extension
+// intact end-to-end (bare Blobs can lose it in some multipart stacks).
+export async function sendFile({ chatId, filePath, filename, caption, kind = 'document' }) {
   const blob = await openAsBlob(filePath);
   const form = new FormData();
   form.append('chat_id', String(chatId));
@@ -69,10 +78,12 @@ export async function sendFile({ chatId, filePath, filename, caption, asVideo })
     form.append('caption', caption.slice(0, 1024));
     form.append('parse_mode', 'HTML');
   }
-  const method = asVideo ? 'sendVideo' : 'sendDocument';
-  const field = asVideo ? 'video' : 'document';
-  if (asVideo) form.append('supports_streaming', 'true');
-  form.append(field, blob, filename);
+  const method = kind === 'video' ? 'sendVideo' : kind === 'audio' ? 'sendAudio' : 'sendDocument';
+  const field = kind === 'video' ? 'video' : kind === 'audio' ? 'audio' : 'document';
+  if (kind === 'video') form.append('supports_streaming', 'true');
+  const ext = (/\.([A-Za-z0-9]{1,5})$/.exec(filename || '') || [])[1]?.toLowerCase() || '';
+  const file = new File([blob], filename, { type: MIME_BY_EXT[ext] || 'application/octet-stream' });
+  form.append(field, file, filename);
 
   const resp = await fetch(`${base()}/${method}`, {
     method: 'POST',

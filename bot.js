@@ -21,11 +21,41 @@ const cache = new Cache();
 const maxBytes = config.maxFileMb * 1024 * 1024;
 
 const VIDEO_EXT = new Set(['mp4', 'mkv', 'webm', 'mov', 'm4v', 'avi', 'mpg', 'mpeg']);
-const isVideo = (name) => VIDEO_EXT.has(String(name).split('.').pop().toLowerCase());
+const AUDIO_EXT = new Set(['mp3', 'm4a', 'flac', 'wav', 'ogg', 'aac', 'opus', 'wma']);
+const extOf = (name) => {
+  const m = /\.([A-Za-z0-9]{1,5})$/.exec(String(name || '').trim());
+  return m ? m[1].toLowerCase() : '';
+};
+const mediaKind = (name) => {
+  const e = extOf(name);
+  if (VIDEO_EXT.has(e)) return 'video';
+  if (AUDIO_EXT.has(e)) return 'audio';
+  return 'document';
+};
+
+// Build a clean Telegram filename that ALWAYS keeps its extension. Telegram
+// clients can't open files whose names get truncated past the extension.
+function safeFileName(name, dlink) {
+  let base = String(name || '').trim().replace(/[\\/:*?"<>|\r\n]+/g, '_');
+  if (/^https?:/i.test(base)) base = '';
+  let ext = extOf(base);
+  if (!ext && dlink) {
+    try {
+      ext = extOf(decodeURIComponent(new URL(dlink).pathname));
+    } catch {
+      ext = '';
+    }
+  }
+  let core = base;
+  if (ext && core.toLowerCase().endsWith('.' + ext)) core = core.slice(0, -(ext.length + 1));
+  core = core.replace(/\.+$/, '').trim() || 'file';
+  if (core.length > 60) core = core.slice(0, 60).trimEnd();
+  return ext ? `${core}.${ext}` : core;
+}
 
 // Download a dlink to a temp file, enforcing the size cap both from the
 // content-length header and while streaming.
-async function downloadToDisk(dlink, headers) {
+async function downloadToDisk(dlink, headers, ext = '') {
   const resp = await fetch(dlink, { headers, redirect: 'follow' });
   if (!resp.ok && resp.status !== 206) {
     resp.body?.cancel().catch(() => {});
@@ -38,7 +68,10 @@ async function downloadToDisk(dlink, headers) {
     e.tooBig = true;
     throw e;
   }
-  const tmp = path.join(downloadDir, `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  const tmp = path.join(
+    downloadDir,
+    `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext ? `.${ext}` : ''}`,
+  );
   let received = 0;
   const guard = new Transform({
     transform(chunk, enc, cb) {
@@ -154,22 +187,27 @@ async function handleCallback(cq) {
   );
   let tmp = null;
   try {
+    const fname = safeFileName(file.name, file.dlink);
     const headers = entry.provider.downloadHeaders(cookiePool.next() || '');
-    tmp = await downloadToDisk(file.dlink, headers);
+    tmp = await downloadToDisk(file.dlink, headers, extOf(fname));
     await tg.editMessageText(
       chatId,
       status.message_id,
-      `📤 Uploading <b>${esc(file.name)}</b> to Telegram…`,
+      `📤 Uploading <b>${esc(fname)}</b> to Telegram…`,
     );
-    const video = isVideo(file.name);
-    await tg.sendChatAction(chatId, video ? 'upload_video' : 'upload_document');
-    const caption = `📦 ${esc(file.name)} (${esc(file.size)})`;
+    const kind = mediaKind(fname);
+    await tg.sendChatAction(
+      chatId,
+      kind === 'video' ? 'upload_video' : kind === 'audio' ? 'upload_audio' : 'upload_document',
+    );
+    const caption = `📦 ${esc(fname)} (${esc(file.size)})`;
     try {
-      await tg.sendFile({ chatId, filePath: tmp, filename: file.name, caption, asVideo: video });
+      await tg.sendFile({ chatId, filePath: tmp, filename: fname, caption, kind });
     } catch (e1) {
-      if (!video) throw e1;
-      // Some containers (e.g. mkv) are rejected by sendVideo — fall back to document.
-      await tg.sendFile({ chatId, filePath: tmp, filename: file.name, caption, asVideo: false });
+      if (kind === 'document') throw e1;
+      // Telegram may reject some containers as video/audio — retry as a plain document.
+      console.error(`${kind} upload failed (${e1.message}) — retrying as document`);
+      await tg.sendFile({ chatId, filePath: tmp, filename: fname, caption, kind: 'document' });
     }
     await tg.deleteMessage(chatId, status.message_id);
   } catch (err) {

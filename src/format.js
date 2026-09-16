@@ -4,7 +4,10 @@ import { fileEmoji } from './utils.js';
 export const esc = (s) =>
   String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+const trunc = (s, n = 40) => (String(s).length > n ? `${String(s).slice(0, n - 1)}…` : String(s));
+
 const MAX_BUTTONS = 10; // Telegram allows up to 100, but keep messages tidy.
+const MAX_SONG_RESULTS = 4; // keep the /song card under Telegram's 4096-char cap
 
 const PROVIDER_STYLE = {
   diskwala: { icon: '🎬', label: 'DISKWALA' },
@@ -12,7 +15,49 @@ const PROVIDER_STYLE = {
   youtube: { icon: '📺', label: 'YOUTUBE' },
 };
 
+const SONG_SECTIONS = {
+  apple: { icon: '🍎', label: 'APPLE MUSIC' },
+  spotify: { icon: '🟢', label: 'SPOTIFY' },
+  whatmusic: { icon: '🎧', label: 'WHATMUSIC' },
+};
+
 const DIVIDER = '┄┄┄┄┄┄┄┄┄┄┄┄┄┄';
+
+// /song search results card — sections in the fixed order they were fetched.
+export function buildSongPayload(query, sections) {
+  const lines = [
+    `🎵 <b><u>SONG SEARCH</u></b>`,
+    '',
+    `<code>▎🔎 ${esc(trunc(query, 32))}</code>`,
+    '',
+  ];
+  let total = 0;
+  for (const sec of sections) {
+    const style = SONG_SECTIONS[sec.id] || { icon: '🎵', label: sec.id.toUpperCase() };
+    lines.push(DIVIDER);
+    lines.push(`${style.icon} <b><u>${style.label}</u></b>`);
+    if (sec.error) {
+      lines.push(`<blockquote>⚠️ <i>${esc(sec.error)}</i></blockquote>`);
+    } else if (!sec.results.length) {
+      lines.push('<blockquote>😶 <i>no results found</i></blockquote>');
+    } else {
+      total += sec.results.length;
+      sec.results.slice(0, MAX_SONG_RESULTS).forEach((r, i) => {
+        const open = r.url ? `  •  <a href="${esc(r.url)}">▶️ open</a>` : '';
+        lines.push(
+          `${i + 1}. <b>${esc(trunc(r.title, 38))}</b>${r.artist ? `\n    🎤 ${esc(trunc(r.artist, 38))}` : ''}${open}`,
+        );
+      });
+      if (sec.results.length > MAX_SONG_RESULTS) {
+        lines.push(`<i>…and ${sec.results.length - MAX_SONG_RESULTS} more</i>`);
+      }
+    }
+    lines.push('');
+  }
+  lines.push(DIVIDER);
+  lines.push(`<i>🏁 ${total} result${total === 1 ? '' : 's'} across ${sections.length} services</i>`);
+  return { text: lines.join('\n') };
+}
 
 // Quality-picker card (YouTube): the actual download links resolve lazily
 // when a quality button is tapped. Callback data: q:<cacheId>:<format>:<type>

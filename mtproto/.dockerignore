@@ -1,9 +1,4 @@
-node_modules/
 .env
-downloads/
-*.log
-.DS_Store
-
 __pycache__/
 *.pyc
 *.session

@@ -51,10 +51,15 @@ class ArchiveService:
         new = sum(kind != 'duplicate' for _, kind in records)
         for record, kind in records:
             if kind == 'duplicate':
-                text = ('✅ Already processed.' if record['state'] == 'completed' else
-                        '⚠️ This link needs an archive review; it will not be uploaded again automatically.' if record['state'] == 'review' else
-                        '⏳ Already queued or processing. Use the delivery bot once it is ready.')
-                await message.reply_text(text, reply_markup=self.button(record), disable_web_page_preview=True)
+                if record['state'] == 'completed':
+                    # Only videos already stored in the database get the companion-bot link.
+                    await message.reply_text('✅ Already processed.', reply_markup=self.button(record),
+                                             disable_web_page_preview=True)
+                    continue
+                text = ('⚠️ This link needs an archive review; it will not be uploaded again automatically.'
+                        if record['state'] == 'review' else
+                        '⏳ Already queued or processing. You will receive it here when it is done.')
+                await message.reply_text(text, disable_web_page_preview=True)
         await message.reply_text(f'Saved {len(records)} unique links to the database. {new} new/retry jobs queued; '
                                  f'{len(records)-new} duplicates skipped. Files go to the storage channel and you, one at a time.')
         self.wake.set()
@@ -171,7 +176,7 @@ class ArchiveService:
             except StorageError:
                 log.warning('Could not persist archive job completion; review may be required')
             await self.notify(chat, f'Archive job: {final_state}.\nStored: {stored} · Sent to you: {copied}'
-                              f' · Failed: {failed} · Too large: {skipped}', reply_markup=self.button(record))
+                              f' · Failed: {failed} · Too large: {skipped}')
 
     async def copy_to_user(self, asset, chat):
         try:

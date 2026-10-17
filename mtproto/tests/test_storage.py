@@ -173,6 +173,18 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Already processed',first.args[0])
         self.assertEqual(first.kwargs['reply_markup'].inline_keyboard[0][0].url,
             'https://t.me/delivery_test_bot?start='+self.job['token'])
+    async def test_queued_duplicate_gets_no_companion_button(self):
+        msg=SimpleNamespace(chat=SimpleNamespace(id=200),reply_text=AsyncMock())
+        await self.service.submit(msg,[URL])
+        first=msg.reply_text.await_args_list[0]
+        self.assertIn('Already queued',first.args[0]);self.assertNotIn('reply_markup',first.kwargs)
+    async def test_new_video_is_sent_directly_without_companion_button(self):
+        with patch('archive_service.resolve',AsyncMock(return_value=self.result)),\
+             patch('archive_service.download_to_disk',side_effect=self.download):
+            await self.service.process(self.job)
+        self.client.copy_message.assert_awaited_once_with(100,-100123,42)
+        summary=self.client.send_message.await_args_list[-1]
+        self.assertIn('completed',summary.args[1]);self.assertNotIn('reply_markup',summary.kwargs)
     async def test_worker_shutdown_cancels_active_transfer_without_orphan_task(self):
         await self.ledger.finish(self.job['id'],self.service.owner,'cancelled')
         await self.ledger.enqueue([URL],100)

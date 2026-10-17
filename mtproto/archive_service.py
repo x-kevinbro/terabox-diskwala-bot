@@ -13,7 +13,7 @@ from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from downloader import DownloadError, cleanup, download_to_disk
-from resolvers import download_headers, resolve
+from resolvers import download_headers, format_size, resolve
 from storage import ReviewRequired, StorageError
 
 log = logging.getLogger('archive')
@@ -25,6 +25,15 @@ def file_digest(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def esc(text):
+    return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def bar(done, total):
+    filled = max(0, min(12, int(done / total * 12))) if total else 2
+    return '\u2593' * filled + '\u2591' * (12 - filled)
 
 
 def file_slot(item, index):
@@ -60,8 +69,8 @@ class ArchiveService:
                         if record['state'] == 'review' else
                         '⏳ Already queued or processing. You will receive it here when it is done.')
                 await message.reply_text(text, disable_web_page_preview=True)
-        await message.reply_text(f'Saved {len(records)} unique links to the database. {new} new/retry jobs queued; '
-                                 f'{len(records)-new} duplicates skipped. Files go to the storage channel and you, one at a time.')
+        if new and self.current is not None:
+            await message.reply_text('\u23f3 Added to the queue. Your video will be sent here.')
         self.wake.set()
         return records
 
@@ -175,8 +184,36 @@ class ArchiveService:
                 await self.ledger.finish(key, self.owner, final_state, error)
             except StorageError:
                 log.warning('Could not persist archive job completion; review may be required')
-            await self.notify(chat, f'Archive job: {final_state}.\nStored: {stored} · Sent to you: {copied}'
-                              f' · Failed: {failed} · Too large: {skipped}')
+            # Successful jobs only deliver the video itself; problems get one short reply.
+            if final_state != 'completed' and final_state != 'cancelled':
+                await self.notify(chat, '\u274c Could not get the video from this link.' if not stored else
+                                  f'\u26a0\ufe0f Some files could not be sent ({failed + skipped} of {stored + failed + skipped}).')
+
+    async def edit(self, status, text):
+        if status is None:
+            return
+        try:
+            await status.edit_text(text, disable_web_page_preview=True)
+        except FloodWait as exc:
+            await asyncio.sleep(exc.value)
+        except Exception:
+            pass
+
+    def progress(self, status, verb, name):
+        started, last = time.monotonic(), [0.0]
+        interval = getattr(self.config, 'progress_interval', 5)
+
+        async def tick(done, total):
+            now = time.monotonic()
+            if now - last[0] < interval * 0.8:
+                return
+            last[0] = now
+            speed = done / max(0.1, now - started) / 1024 / 1024
+            pct = f'{done / total * 100:.1f}%' if total else format_size(done)
+            await self.edit(status, f'{verb}\n<code>{esc(name)}</code>\n\n<code>{bar(done, total)}</code> {pct}\n'
+                            f'\U0001f4be {format_size(done)}' + (f' / {format_size(total)}' if total else '')
+                            + f'\n\u26a1 {speed:.2f} MB/s')
+        return tick
 
     async def copy_to_user(self, asset, chat):
         try:
@@ -202,10 +239,13 @@ class ArchiveService:
         if item.size_bytes > self.config.max_bytes:
             raise DownloadError('too_big', too_big=True)
         path = None
+        status = None
+        name = item.name[:180]
         async with self.transfer_slot():
             try:
-                await self.notify(record['chat_id'], f'Downloading: {item.name[:180]}', parse_mode=ParseMode.DISABLED)
-                path = await download_to_disk(self.http, item.dlink, download_headers(result.share_url), item.name)
+                status = await self.notify(record['chat_id'], f'\u2b07\ufe0f <b>Starting download\u2026</b>\n<code>{esc(name)}</code>')
+                path = await download_to_disk(self.http, item.dlink, download_headers(result.share_url), item.name,
+                                              self.progress(status, '\u2b07\ufe0f <b>Downloading\u2026</b>', name))
                 # Wait for the hash thread to finish before cleanup on cancellation.
                 hashing = asyncio.create_task(asyncio.to_thread(file_digest, path))
                 try:
@@ -221,7 +261,9 @@ class ArchiveService:
                 else:
                     # Committed 'uploading' intent precedes Telegram. Unknown outcomes are never retried blindly.
                     caption = item.name[:900]
-                    kwargs = dict(caption=caption, parse_mode=ParseMode.DISABLED, file_name=item.name)
+                    await self.edit(status, f'\u2b06\ufe0f <b>Uploading to Telegram\u2026</b>\n<code>{esc(name)}</code>')
+                    kwargs = dict(caption=caption, parse_mode=ParseMode.DISABLED, file_name=item.name,
+                                  progress=self.progress(status, '\u2b06\ufe0f <b>Uploading\u2026</b>', name))
                     ext = Path(item.name).suffix.lower()
                     try:
                         if ext in {'.mp4', '.mkv', '.webm', '.mov', '.m4v', '.avi'}:
@@ -243,6 +285,19 @@ class ArchiveService:
                                                              getattr(media, 'file_id', '') or '')
                     except StorageError:
                         raise ReviewRequired('Channel upload acknowledgement was not persisted') from None
-                return asset, await self.copy_to_user(asset, record['chat_id'])
+                delivered = await self.copy_to_user(asset, record['chat_id'])
+                await self.edit(status, f'\u2705 <b>Sent!</b>\n<code>{esc(name)}</code>' if delivered else
+                                f'\u26a0\ufe0f <b>Could not send</b>\n<code>{esc(name)}</code>')
+                return asset, delivered
+            except DownloadError as exc:
+                await self.edit(status, f'\u26a0\ufe0f <b>File is too large.</b>\n<code>{esc(name)}</code>' if exc.too_big
+                                else f'\u274c <b>Download failed</b>\n<code>{esc(name)}</code>')
+                raise
+            except asyncio.CancelledError:
+                await self.edit(status, f'\u23f9 <b>Cancelled</b>\n<code>{esc(name)}</code>')
+                raise
+            except Exception:
+                await self.edit(status, f'\u274c <b>Failed</b>\n<code>{esc(name)}</code>')
+                raise
             finally:
                 cleanup(path)

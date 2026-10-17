@@ -147,7 +147,7 @@ async def process_pages(message: Message, pages: list[str], direct: list[str]) -
                 return
             if archive is not None:
                 await archive.submit(message, links, pages[0] if pages else "")
-                await safe_edit(status, f"Saved {len(links)} unique links to the archive database. Failed page scans: {page_failures}.")
+                await safe_edit(status, f"<b>Found {len(links)} unique share links.</b>\nSending videos one by one. Use /cancel to stop.")
                 return
             await message.reply_text(
                 f"<b>Found {len(links)} unique share links.</b>\nDownloading and sending files one by one. Use /cancel to stop.",

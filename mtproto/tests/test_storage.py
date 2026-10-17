@@ -116,7 +116,8 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp=tempfile.TemporaryDirectory();self.db=SQLiteSQL();self.ledger=Ledger(self.db)
         await self.ledger.initialize()
-        self.client=SimpleNamespace(send_message=AsyncMock(),copy_message=AsyncMock(),
+        self.status=SimpleNamespace(edit_text=AsyncMock())
+        self.client=SimpleNamespace(send_message=AsyncMock(return_value=self.status),copy_message=AsyncMock(),
             send_video=AsyncMock(return_value=SimpleNamespace(chat=SimpleNamespace(id=-100123),id=42,
                         video=SimpleNamespace(file_id='id'),document=None)))
         self.config=SimpleNamespace(storage_channel_id=-100123,max_bytes=10000,request_timeout=1)
@@ -183,8 +184,20 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
              patch('archive_service.download_to_disk',side_effect=self.download):
             await self.service.process(self.job)
         self.client.copy_message.assert_awaited_once_with(100,-100123,42)
-        summary=self.client.send_message.await_args_list[-1]
-        self.assertIn('completed',summary.args[1]);self.assertNotIn('reply_markup',summary.kwargs)
+        texts=[c.args[1] for c in self.client.send_message.await_args_list]
+        self.assertEqual(len(texts),1);self.assertIn('Starting download',texts[0])
+        self.assertNotIn('reply_markup',self.client.send_message.await_args_list[0].kwargs)
+        self.assertIn('Sent!',self.status.edit_text.await_args_list[-1].args[0])
+    async def test_failed_link_gets_one_short_reply_without_log(self):
+        with patch('archive_service.resolve',AsyncMock(side_effect=RuntimeError('down'))):
+            await self.service.process(self.job)
+        texts=[c.args[1] for c in self.client.send_message.await_args_list]
+        self.assertEqual(texts,['\u274c Could not get the video from this link.'])
+    async def test_new_link_while_idle_sends_no_database_log(self):
+        await self.ledger.finish(self.job['id'],self.service.owner,'completed')
+        msg=SimpleNamespace(chat=SimpleNamespace(id=200),reply_text=AsyncMock())
+        await self.service.submit(msg,['https://teraboxshare.com/s/1newlinkabc'])
+        msg.reply_text.assert_not_awaited()
     async def test_worker_shutdown_cancels_active_transfer_without_orphan_task(self):
         await self.ledger.finish(self.job['id'],self.service.owner,'cancelled')
         await self.ledger.enqueue([URL],100)

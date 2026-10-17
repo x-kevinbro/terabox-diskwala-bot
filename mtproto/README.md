@@ -43,3 +43,33 @@ python bot.py
 
 `GET /api/health` returns JSON with bot username, active jobs and the upload
 ceiling - use it for Koyeb health checks and UptimeRobot.
+
+## Graph / Telegraph automatic batches
+
+Send a public `https://graph.org/...` or `https://telegra.ph/...` article in a
+private chat. The bot scans article hyperlinks and plain-text URLs, removes
+duplicates, and automatically resolves, downloads, and uploads supported
+Diskwala/Terabox files **one at a time, in article order**. Individual failures
+are counted and processing continues. It does not crawl linked articles.
+
+- Up to 5 articles, 50 unique share links, and 100 attempted files per batch.
+- Up to 4 pending batches globally; one batch per chat. Batches run sequentially.
+- `/cancel` stops your batch and removes temporary files. Sent files remain.
+- Files above `MAX_FILE_MB` are skipped with a direct link instead.
+- Batches are in memory and do not resume after a restart.
+- Ordinary direct share links keep their existing manual download buttons.
+- Health includes build identifier, active transfers, queued transfers, and
+  pending batches. Tokens and media are not exposed in the health response.
+
+## Offline regression tests
+
+From the repository root, after installing `mtproto/requirements.txt`:
+
+```bash
+python -m unittest discover -s mtproto/tests -v
+```
+
+Tests use fake credentials and mocked Telegram/resolver/download calls; they
+never send a message or download media. Coverage includes article parsing,
+redirect restrictions, limits, sequential delivery, cancellation, cleanup,
+transfer counters, and existing direct-link behavior.

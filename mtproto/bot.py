@@ -15,6 +15,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
+from contextlib import asynccontextmanager
 
 import aiohttp
 from pyrogram import Client, filters
@@ -23,6 +24,8 @@ from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import health
+from telegraph import MAX_LINKS, PageError, fetch_article, normalize_share, page_links
+from page_batch import BatchStats, MAX_FILES, MAX_PENDING_BATCHES, run_batch
 from config import config
 from downloader import DownloadError, cleanup, download_to_disk
 from resolvers import (
@@ -67,9 +70,129 @@ app = Client(
 
 job_slot = asyncio.Semaphore(config.max_concurrent_jobs)
 http: aiohttp.ClientSession | None = None
+batch_lock = asyncio.Lock()
+batch_jobs: dict[int, asyncio.Task] = {}
 # Short-lived cache so inline buttons stay under Telegram's 64-byte callback cap.
 cache: dict[str, tuple[float, Resolved]] = {}
 CACHE_TTL = 3600
+
+
+@asynccontextmanager
+async def transfer_slot():
+    health.STATE["queued_jobs"] += 1
+    acquired = False
+    try:
+        await job_slot.acquire()
+        acquired = True
+        health.STATE["queued_jobs"] -= 1
+        health.STATE["active_jobs"] += 1
+        yield
+    finally:
+        if acquired:
+            health.STATE["active_jobs"] -= 1
+            job_slot.release()
+        else:
+            health.STATE["queued_jobs"] -= 1
+
+
+def batch_summary(stats: BatchStats, total: int, cancelled: bool = False) -> str:
+    title = "Batch cancelled" if cancelled else "Batch complete"
+    return (f"<b>{title}</b>\n"
+            f"Links processed: {stats.links}/{total}\n"
+            f"Sent: {stats.sent} · Skipped/too large: {stats.skipped}\n"
+            f"Failed files: {stats.failed} · Failed links: {stats.link_failures}"
+            + (f"\nStopped at the {MAX_FILES}-file safety limit." if stats.limited else ""))
+
+
+async def process_pages(message: Message, pages: list[str], direct: list[str]) -> None:
+    status = None
+    stats = BatchStats()
+    links: list[str] = []
+    page_failures = 0
+    try:
+        status = await message.reply_text(
+            "<b>Graph/Telegraph batch queued</b>\nPages are processed one at a time. Use /cancel to stop.",
+            disable_web_page_preview=True,
+        )
+        async with batch_lock:
+            await safe_edit(status, "<b>Scanning Graph/Telegraph article links…</b>")
+            seen: set[str] = set()
+            for page in pages:
+                try:
+                    extracted = await fetch_article(http, page, config.request_timeout)
+                except PageError as exc:
+                    page_failures += 1
+                    await message.reply_text(f"<b>Page scan failed:</b> {html_escape(str(exc))}", disable_web_page_preview=True)
+                    continue
+                for url in extracted:
+                    if url not in seen:
+                        seen.add(url)
+                        links.append(url)
+            for raw in direct:
+                url = normalize_share(raw)
+                if url and url not in seen:
+                    seen.add(url)
+                    links.append(url)
+            if len(links) > MAX_LINKS:
+                await safe_edit(status, f"This batch contains {len(links)} links; the limit is {MAX_LINKS}. Send fewer pages.")
+                return
+            if not links:
+                await safe_edit(status, "<b>No supported share links were found.</b> The article must contain public Diskwala/Terabox links.")
+                return
+            await message.reply_text(
+                f"<b>Found {len(links)} unique share links.</b>\nDownloading and sending files one by one. Use /cancel to stop.",
+                disable_web_page_preview=True,
+            )
+
+            async def resolve_link(url):
+                return await resolve(http, url, config.request_timeout)
+
+            async def send_file(result, item, index):
+                return await deliver(message, result, item, index)
+
+            async def progress(number, total, current):
+                await safe_edit(status, f"<b>Batch: link {number}/{total}</b>\nSent: {current.sent} · Failed links: {current.link_failures}\nFiles are sent sequentially. Use /cancel to stop.")
+
+            await run_batch(links, resolve_link, send_file, progress, stats)
+            await safe_edit(status, batch_summary(stats, len(links)) + f"\nFailed page scans: {page_failures}")
+    except asyncio.CancelledError:
+        if status:
+            await safe_edit(status, batch_summary(stats, len(links), cancelled=True))
+        raise
+    except Exception:
+        log.exception("page batch failed")
+        if status:
+            await safe_edit(status, "<b>Batch stopped unexpectedly.</b> Already sent files are unaffected. Please retry the remaining links.")
+    finally:
+        if batch_jobs.get(message.chat.id) is asyncio.current_task():
+            batch_jobs.pop(message.chat.id, None)
+        health.STATE["pending_batches"] = len(batch_jobs)
+
+
+def forget_batch(chat_id: int, task: asyncio.Task) -> None:
+    # A task cancelled before its first coroutine step never reaches its finally.
+    if batch_jobs.get(chat_id) is task:
+        batch_jobs.pop(chat_id, None)
+    health.STATE["pending_batches"] = len(batch_jobs)
+
+
+def message_link_text(message: Message) -> str:
+    # Telegram text_link entities contain URLs that are absent from visible text.
+    hidden = [entity.url for entity in [*(message.entities or []), *(message.caption_entities or [])]
+              if getattr(entity, "url", None)]
+    return "\n".join([message.text or message.caption or "", *hidden])
+
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def on_cancel(_client: Client, message: Message) -> None:
+    if not allowed(message.from_user.id):
+        return
+    task = batch_jobs.get(message.chat.id)
+    if task and not task.done():
+        task.cancel()
+        await message.reply_text("Cancelling your Graph/Telegraph batch. Already sent files will stay in the chat.")
+    else:
+        await message.reply_text("You have no active Graph/Telegraph batch.")
 
 
 def remember(result: Resolved) -> str:
@@ -177,6 +300,8 @@ async def on_start(_client: Client, message: Message) -> None:
         "<blockquote>\U0001f517 Send me a Diskwala or Terabox share link and I'll fetch the file.</blockquote>\n\n"
         "<b>What I do:</b>\n"
         "\U0001f3ac Diskwala &amp; \U0001f4e6 Terabox links \u2192 info + downloads\n"
+        "Graph/Telegraph page \u2192 scan and send every file sequentially\n"
+        "Use /cancel to stop a page batch (up to 50 links / 100 files).\n"
         f"\U0001f4e6 Files up to <b>{config.max_file_mb} MB</b> land right here in chat\n"
         "\U0001f3a5 Videos arrive as playable video, music as audio\n"
         "\U0001f517 Anything larger \u2192 direct download link\n\n"
@@ -185,17 +310,38 @@ async def on_start(_client: Client, message: Message) -> None:
     )
 
 
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "help"]))
+@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["start", "help", "cancel"]))
 async def on_link(_client: Client, message: Message) -> None:
     if not allowed(message.from_user.id):
         await message.reply_text("\U0001f512 <b>Private bot</b>\n<blockquote>Access denied.</blockquote>")
         return
 
-    links = extract_links(message.text or message.caption or "")
+    text = message_link_text(message)
+    try:
+        pages = page_links(text)
+    except PageError as exc:
+        await message.reply_text(html_escape(str(exc)))
+        return
+    if pages:
+        existing = batch_jobs.get(message.chat.id)
+        if existing and not existing.done():
+            await message.reply_text("You already have a page batch running. Use /cancel before starting another.")
+            return
+        if len(batch_jobs) >= MAX_PENDING_BATCHES:
+            await message.reply_text("The page-batch queue is full. Please try again later.")
+            return
+        direct = [url for url, _ in extract_links(text, limit=MAX_LINKS + 1)]
+        task = asyncio.create_task(process_pages(message, pages, direct))
+        batch_jobs[message.chat.id] = task
+        task.add_done_callback(lambda done: forget_batch(message.chat.id, done))
+        health.STATE["pending_batches"] = len(batch_jobs)
+        return
+
+    links = extract_links(text)
     if not links:
         await message.reply_text(
             "\U0001f914 <b>No supported link found there.</b>\n\n"
-            "Send a Diskwala or Terabox link, e.g.\n"
+            "Send a Graph/Telegraph article, Diskwala or Terabox link, e.g.\n"
             "<code>https://diskwala.com/app/xxxx</code>\n"
             "<code>https://teraboxshare.com/s/xxxx</code>",
             disable_web_page_preview=True,
@@ -267,19 +413,21 @@ async def on_button(_client: Client, query: CallbackQuery) -> None:
         return
 
     await query.answer("Queued\u2026")
-    await deliver(query, result, item, index)
+    await deliver(query.message, result, item, index)
 
 
-async def deliver(query: CallbackQuery, result: Resolved, item, index: int) -> None:
-    status = await query.message.reply_text(
+async def deliver(message: Message, result: Resolved, item, index: int) -> str:
+    if item.size_bytes and item.size_bytes > config.max_bytes:
+        await message.reply_text(f"<b>Too large:</b> {html_escape(item.name)} ({item.pretty_size}).\n<code>{html_escape(item.dlink)}</code>", disable_web_page_preview=True)
+        return "skipped"
+    status = await message.reply_text(
         f"\u2b07\ufe0f <b>Starting download\u2026</b>\n<code>{html_escape(item.name)}</code>"
     )
 
     if job_slot.locked():
         await safe_edit(status, "\u23f3 <b>Another transfer is running \u2014 you're next in queue\u2026</b>")
 
-    async with job_slot:  # one transfer at a time: protects RAM and disk
-        health.STATE["active_jobs"] = config.max_concurrent_jobs - job_slot._value
+    async with transfer_slot():  # shared by buttons and automatic page batches
         path: Path | None = None
         try:
             # Links can expire between resolve and button press; refresh first.
@@ -292,6 +440,9 @@ async def deliver(query: CallbackQuery, result: Resolved, item, index: int) -> N
             except Exception as exc:
                 log.info("refresh failed, using cached link: %s", exc)
 
+            if fresh.size_bytes and fresh.size_bytes > config.max_bytes:
+                await safe_edit(status, f"<b>Too large:</b> {html_escape(fresh.name)}\n<code>{html_escape(fresh.dlink)}</code>")
+                return "skipped"
             headers = download_headers(result.share_url)
             started = time.monotonic()
 
@@ -352,7 +503,7 @@ async def deliver(query: CallbackQuery, result: Resolved, item, index: int) -> N
                 if ext_of(fresh.name) in AUDIO_EXT
                 else "document"
             )
-            target = query.message.chat.id
+            target = message.chat.id
             # Pyrogram streams the file from disk, so RAM stays flat here too.
             if kind == "video":
                 await app.send_video(
@@ -378,6 +529,7 @@ async def deliver(query: CallbackQuery, result: Resolved, item, index: int) -> N
                 )
 
             await safe_edit(status, f"\u2705 <b>Sent!</b>\n<code>{html_escape(fresh.name)}</code>")
+            return "sent"
         except DownloadError as exc:
             if exc.too_big:
                 await safe_edit(
@@ -385,17 +537,19 @@ async def deliver(query: CallbackQuery, result: Resolved, item, index: int) -> N
                     f"\u26a0\ufe0f <b>File exceeds {config.max_file_mb} MB.</b>\n\n"
                     f"<code>{html_escape(item.dlink)}</code>",
                 )
+                return "skipped"
             else:
                 await safe_edit(status, f"\u274c <b>{html_escape(str(exc))}</b>\n\n<code>{html_escape(item.dlink)}</code>")
         except FloodWait as exc:
             await safe_edit(status, f"\u23f3 <b>Telegram rate limit \u2014 wait {exc.value}s and retry.</b>")
+            await asyncio.sleep(exc.value)
         except Exception as exc:
             log.exception("delivery failed")
             await safe_edit(status, f"\u274c <b>Failed:</b> {html_escape(exc.__class__.__name__)}")
         finally:
-            # Always free the disk immediately, success or failure.
+            # Cancellation also releases the slot and cleans up the staged file.
             cleanup(path)
-            health.STATE["active_jobs"] = config.max_concurrent_jobs - job_slot._value
+        return "failed"
 
 
 async def main() -> None:
@@ -419,6 +573,10 @@ async def main() -> None:
         log.info("Providers: diskwala, terabox | public=%s", config.public_bot)
         await asyncio.Event().wait()
     finally:
+        for task in list(batch_jobs.values()):
+            task.cancel()
+        if batch_jobs:
+            await asyncio.gather(*list(batch_jobs.values()), return_exceptions=True)
         health.STATE["bot"] = "stopped"
         await http.close()
         try:

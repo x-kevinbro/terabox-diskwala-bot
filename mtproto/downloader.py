@@ -6,6 +6,7 @@ and the 512 MB Koyeb instance cannot OOM.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import time
@@ -55,7 +56,7 @@ async def download_to_disk(
             # transfer must never be aborted mid-stream.
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=config.request_timeout, sock_read=120),
         )
-    except aiohttp.ClientError as exc:
+    except (aiohttp.ClientError, TimeoutError) as exc:
         raise DownloadError(f"download connection failed ({exc.__class__.__name__})", retryable=True) from exc
 
     async with response:
@@ -85,10 +86,13 @@ async def download_to_disk(
                         if now - last_tick >= config.progress_interval:
                             last_tick = now
                             await on_progress(received, total)
+        except asyncio.CancelledError:
+            cleanup(target)
+            raise
         except DownloadError:
             cleanup(target)
             raise
-        except (aiohttp.ClientError, OSError) as exc:
+        except (aiohttp.ClientError, OSError, TimeoutError) as exc:
             cleanup(target)
             raise DownloadError(f"transfer interrupted ({exc.__class__.__name__})", retryable=True) from exc
 

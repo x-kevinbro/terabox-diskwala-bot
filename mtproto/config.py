@@ -59,6 +59,13 @@ class Config:
     port: int = _int("PORT", 8000)
     workdir: Path = Path(os.getenv("SESSION_DIR", "/tmp/session"))
 
+    # Opt-in: disabled until both bots, Turso and storage channel are configured.
+    archive_enabled: bool = os.getenv("ARCHIVE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    turso_database_url: str = os.getenv("TURSO_DATABASE_URL", "")
+    turso_auth_token: str = os.getenv("TURSO_AUTH_TOKEN", "")
+    storage_channel_id: int = _int("STORAGE_CHANNEL_ID", 0)
+    delivery_bot_token: str = os.getenv("DELIVERY_BOT_TOKEN", "")
+
     @property
     def max_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
@@ -71,6 +78,17 @@ class Config:
             gaps.append("API_HASH")
         if not self.bot_token:
             gaps.append("BOT_TOKEN")
+        if self.archive_enabled:
+            for name, value in [("TURSO_DATABASE_URL", self.turso_database_url),
+                                ("TURSO_AUTH_TOKEN", self.turso_auth_token),
+                                ("STORAGE_CHANNEL_ID", self.storage_channel_id),
+                                ("DELIVERY_BOT_TOKEN", self.delivery_bot_token)]:
+                if not value:
+                    gaps.append(name)
+            if self.storage_channel_id and self.storage_channel_id >= 0:
+                gaps.append("STORAGE_CHANNEL_ID must be a negative channel ID")
+            if self.delivery_bot_token and self.delivery_bot_token == self.bot_token:
+                gaps.append("DELIVERY_BOT_TOKEN must belong to a different bot")
         return gaps
 
 

@@ -12,21 +12,27 @@ STATE: dict[str, object] = {"bot": "starting", "active_jobs": 0, "queued_jobs": 
 
 
 async def _health(_request: web.Request) -> web.Response:
+    worker = STATE.get("archive_worker")
+    ready = str(STATE.get("bot", "")).startswith("@") and (
+        not config.archive_enabled or (STATE.get("archive") == "ready" and worker is not None and not worker.done()))
     return web.json_response(
         {
-            "success": True,
-            "status": "ok",
+            "success": ready,
+            "status": "ok" if ready else "not_ready",
             "engine": "mtproto",
-            "build": "graph-batch-v1",
-            "features": ["graph-page-batches", "sequential-delivery", "cancel-batch"],
+            "build": "turso-archive-v1",
+            "features": ["graph-page-batches", "sequential-delivery", "cancel-batch"] + (["turso-archive", "delivery-bot"] if config.archive_enabled else []),
             "bot": STATE.get("bot"),
+            "archive": STATE.get("archive", "disabled"),
+            "delivery_bot": STATE.get("delivery_bot"),
             "active_jobs": STATE.get("active_jobs"),
             "queued_jobs": STATE.get("queued_jobs"),
             "pending_batches": STATE.get("pending_batches"),
             "max_file_mb": config.max_file_mb,
             "uptime_seconds": int(time.time() - STARTED),
             "providers": ["diskwala", "terabox"],
-        }
+        },
+        status=200 if ready else 503,
     )
 
 

@@ -19,11 +19,14 @@ from contextlib import asynccontextmanager
 
 import aiohttp
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
+from pyrogram.enums import ParseMode, ChatMemberStatus
 from pyrogram.errors import FloodWait, MessageNotModified
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import health
+from storage import Ledger, StorageError, TursoSQL
+from archive_service import ArchiveService
+from delivery_bot import create_delivery_bot
 from telegraph import MAX_LINKS, PageError, fetch_article, normalize_share, page_links
 from page_batch import BatchStats, MAX_FILES, MAX_PENDING_BATCHES, run_batch
 from config import config
@@ -70,6 +73,9 @@ app = Client(
 
 job_slot = asyncio.Semaphore(config.max_concurrent_jobs)
 http: aiohttp.ClientSession | None = None
+archive: ArchiveService | None = None
+companion: Client | None = None
+storage_http: aiohttp.ClientSession | None = None
 batch_lock = asyncio.Lock()
 batch_jobs: dict[int, asyncio.Task] = {}
 # Short-lived cache so inline buttons stay under Telegram's 64-byte callback cap.
@@ -139,6 +145,10 @@ async def process_pages(message: Message, pages: list[str], direct: list[str]) -
             if not links:
                 await safe_edit(status, "<b>No supported share links were found.</b> The article must contain public Diskwala/Terabox links.")
                 return
+            if archive is not None:
+                await archive.submit(message, links, pages[0] if pages else "")
+                await safe_edit(status, f"Saved {len(links)} unique links to the archive database. Failed page scans: {page_failures}.")
+                return
             await message.reply_text(
                 f"<b>Found {len(links)} unique share links.</b>\nDownloading and sending files one by one. Use /cancel to stop.",
                 disable_web_page_preview=True,
@@ -186,6 +196,13 @@ def message_link_text(message: Message) -> str:
 @app.on_message(filters.command("cancel") & filters.private)
 async def on_cancel(_client: Client, message: Message) -> None:
     if not allowed(message.from_user.id):
+        return
+    if archive is not None:
+        queued, active = await archive.cancel(message.chat.id)
+        task = batch_jobs.get(message.chat.id)
+        if task and not task.done():
+            task.cancel()
+        await message.reply_text(f"Cancelled {queued} queued archive jobs. Active transfer cancellation: {'requested' if active else 'none'}. Stored files are retained.")
         return
     task = batch_jobs.get(message.chat.id)
     if task and not task.done():
@@ -299,6 +316,7 @@ async def on_start(_client: Client, message: Message) -> None:
         "\U0001f44b <b>Welcome to the Diskwala + Terabox Downloader!</b>\n\n"
         "<blockquote>\U0001f517 Send me a Diskwala or Terabox share link and I'll fetch the file.</blockquote>\n\n"
         "<b>What I do:</b>\n"
+        "When archive mode is enabled: save links first, store files once, and retrieve completed duplicates through the delivery bot.\n"
         "\U0001f3ac Diskwala &amp; \U0001f4e6 Terabox links \u2192 info + downloads\n"
         "Graph/Telegraph page \u2192 scan and send every file sequentially\n"
         "Use /cancel to stop a page batch (up to 50 links / 100 files).\n"
@@ -316,6 +334,9 @@ async def on_link(_client: Client, message: Message) -> None:
         await message.reply_text("\U0001f512 <b>Private bot</b>\n<blockquote>Access denied.</blockquote>")
         return
 
+    if config.archive_enabled and archive is None:
+        await message.reply_text("Archive setup is not ready. Please try again shortly; downloads are paused.")
+        return
     text = message_link_text(message)
     try:
         pages = page_links(text)
@@ -337,6 +358,17 @@ async def on_link(_client: Client, message: Message) -> None:
         health.STATE["pending_batches"] = len(batch_jobs)
         return
 
+    if archive is not None:
+        links = extract_links(text, limit=MAX_LINKS + 1)
+        if len(links) > MAX_LINKS:
+            await message.reply_text(f"Send at most {MAX_LINKS} links at a time.")
+            return
+        if links:
+            try:
+                await archive.submit(message, [url for url, _ in links])
+            except StorageError:
+                await message.reply_text("The archive database is unavailable. Nothing will be downloaded without a saved record; please retry.")
+            return
     links = extract_links(text)
     if not links:
         await message.reply_text(
@@ -371,6 +403,9 @@ async def on_link(_client: Client, message: Message) -> None:
 
 @app.on_callback_query()
 async def on_button(_client: Client, query: CallbackQuery) -> None:
+    if config.archive_enabled:
+        await query.answer("Archive mode is active. Send the share link again to save it safely.", show_alert=True)
+        return
     if not allowed(query.from_user.id):
         await query.answer("Access denied.", show_alert=True)
         return
@@ -553,7 +588,7 @@ async def deliver(message: Message, result: Resolved, item, index: int) -> str:
 
 
 async def main() -> None:
-    global http
+    global http, archive, companion, storage_http
     missing = config.missing()
     runner = await health.start_health_server()
     if missing:
@@ -571,12 +606,48 @@ async def main() -> None:
         log.info("Logged in as @%s (id %s)", me.username, me.id)
         log.info("MTProto build | max file %s MB | chunk %s KB", config.max_file_mb, config.chunk_bytes // 1024)
         log.info("Providers: diskwala, terabox | public=%s", config.public_bot)
+        if config.archive_enabled:
+            health.STATE["archive"] = "starting"
+            # Dedicated DB session: never shares resolver cookies, environment proxies or credentials.
+            storage_http = aiohttp.ClientSession(trust_env=False, cookie_jar=aiohttp.DummyCookieJar())
+            ledger = Ledger(TursoSQL(storage_http, config.turso_database_url, config.turso_auth_token))
+            await ledger.initialize()
+            companion = create_delivery_bot(config, ledger)
+            await companion.start()
+            companion_me = await companion.get_me()
+            if companion_me.id == me.id:
+                raise StorageError("The delivery bot must be a different bot")
+            for client, identity in [(app, me), (companion, companion_me)]:
+                chat = await client.get_chat(config.storage_channel_id)
+                if getattr(chat, "has_protected_content", False):
+                    raise StorageError("Storage channel protected content must be off to copy videos")
+                member = await client.get_chat_member(config.storage_channel_id, identity.id)
+                if member.status not in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
+                    raise StorageError("Both bots must be administrators in the storage channel")
+                if member.privileges and not member.privileges.can_post_messages:
+                    raise StorageError("Both bots need channel posting permission")
+            archive = ArchiveService(ledger, app, http, config, transfer_slot, companion_me.username)
+            archive.worker_task = asyncio.create_task(archive.run())
+            health.STATE["archive_worker"] = archive.worker_task
+            health.STATE["archive"] = "ready"
+            health.STATE["delivery_bot"] = f"@{companion_me.username}"
         await asyncio.Event().wait()
     finally:
         for task in list(batch_jobs.values()):
             task.cancel()
         if batch_jobs:
             await asyncio.gather(*list(batch_jobs.values()), return_exceptions=True)
+        if archive and archive.worker_task:
+            archive.worker_task.cancel()
+            await asyncio.gather(archive.worker_task, return_exceptions=True)
+        if companion:
+            try:
+                await companion.stop()
+            except Exception:
+                pass
+        if storage_http:
+            await storage_http.close()
+        archive = None
         health.STATE["bot"] = "stopped"
         await http.close()
         try:

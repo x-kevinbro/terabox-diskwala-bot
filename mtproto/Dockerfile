@@ -21,7 +21,7 @@ ENV PYTHONUNBUFFERED=1 \
 COPY --from=builder /install /usr/local
 
 WORKDIR /app
-COPY config.py resolvers.py downloader.py health.py telegraph.py page_batch.py bot.py ./
+COPY config.py resolvers.py downloader.py health.py telegraph.py page_batch.py storage.py archive_service.py delivery_bot.py bot.py ./
 
 RUN mkdir -p /tmp/downloads /tmp/session
 

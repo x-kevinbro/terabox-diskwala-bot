@@ -64,6 +64,34 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             await bot.process_pages(msg,['https://graph.org/test'],[])
             self.assertEqual(delivery.await_count,7)
             self.assertIn('Sent: 7',status.edit_text.await_args.args[0])
+    async def test_archive_direct_links_save_before_any_resolve_or_download(self):
+        msg,_=message();msg.text='https://teraboxshare.com/s/one https://terabox.com/s/two'
+        service=SimpleNamespace(submit=AsyncMock())
+        with patch.object(bot,'archive',service),patch.object(bot,'resolve',AsyncMock()) as resolver:
+            await bot.on_link(None,msg)
+            service.submit.assert_awaited_once_with(msg,['https://teraboxshare.com/s/one','https://terabox.com/s/two'])
+            resolver.assert_not_awaited()
+    async def test_archive_graph_scan_enqueues_all_links_without_resolving(self):
+        msg,_=message();links=[f'https://teraboxshare.com/s/{i}' for i in range(7)]
+        service=SimpleNamespace(submit=AsyncMock())
+        with patch.object(bot,'archive',service),patch.object(bot,'fetch_article',AsyncMock(return_value=links)),patch.object(bot,'resolve',AsyncMock()) as resolver:
+            await bot.process_pages(msg,['https://graph.org/test'],[])
+            service.submit.assert_awaited_once_with(msg,links,'https://graph.org/test')
+            resolver.assert_not_awaited()
+    async def test_archive_startup_never_falls_back_to_untracked_downloads(self):
+        msg,_=message()
+        with patch.object(bot,'archive',None),patch.object(bot.config,'archive_enabled',True),patch.object(bot,'resolve',AsyncMock()) as resolver:
+            await bot.on_link(None,msg)
+            self.assertIn('not ready',msg.reply_text.await_args.args[0])
+            resolver.assert_not_awaited()
+    async def test_archive_database_failure_pauses_direct_link_downloads(self):
+        from storage import StorageError
+        msg,_=message();msg.text='https://teraboxshare.com/s/one'
+        service=SimpleNamespace(submit=AsyncMock(side_effect=StorageError('offline')))
+        with patch.object(bot,'archive',service),patch.object(bot,'resolve',AsyncMock()) as resolver:
+            await bot.on_link(None,msg)
+            self.assertIn('unavailable',msg.reply_text.await_args.args[0])
+            resolver.assert_not_awaited()
     async def test_slot_counters_reset_after_success_and_cancelled_waiter(self):
         gate=asyncio.Event()
         async def transfer():

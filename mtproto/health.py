@@ -8,7 +8,7 @@ from aiohttp import web
 from config import config
 
 STARTED = time.time()
-STATE: dict[str, object] = {"bot": "starting", "active_jobs": 0}
+STATE: dict[str, object] = {"bot": "starting", "active_jobs": 0, "queued_jobs": 0, "pending_batches": 0}
 
 
 async def _health(_request: web.Request) -> web.Response:
@@ -17,8 +17,12 @@ async def _health(_request: web.Request) -> web.Response:
             "success": True,
             "status": "ok",
             "engine": "mtproto",
+            "build": "graph-batch-v1",
+            "features": ["graph-page-batches", "sequential-delivery", "cancel-batch"],
             "bot": STATE.get("bot"),
             "active_jobs": STATE.get("active_jobs"),
+            "queued_jobs": STATE.get("queued_jobs"),
+            "pending_batches": STATE.get("pending_batches"),
             "max_file_mb": config.max_file_mb,
             "uptime_seconds": int(time.time() - STARTED),
             "providers": ["diskwala", "terabox"],
